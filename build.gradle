@@ -1,0 +1,123 @@
+import com.eed3si9n.jarjarabrams.Shader
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.commons.ClassRemapper
+import org.objectweb.asm.commons.Remapper
+
+import java.util.zip.ZipFile
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        // Rewrites ScalaSignature alongside the bytecode
+        classpath 'com.eed3si9n.jarjarabrams:jarjar-abrams-core_2.13:1.18.1'
+    }
+}
+
+plugins {
+    id 'java'
+    id 'maven-publish'
+    id 'com.cleanroommc.conventions.base'
+    id 'com.cleanroommc.conventions.publishing'
+}
+
+group = 'com.cleanroommc'
+
+configurations {
+    scala {
+        transitive = false
+    }
+}
+
+dependencies {
+    scala 'org.scala-lang:scala-library:2.11.12'
+    scala 'org.scala-lang.modules:scala-parser-combinators_2.11:1.0.1'
+    scala 'org.scala-lang.modules:scala-xml_2.11:1.0.2'
+}
+
+def mergeScala = tasks.register('mergeScala', Jar) {
+    archiveClassifier = 'unrelocated'
+    from { configurations.scala.collect { zipTree(it) } }
+    from('LICENSE.md') {
+        into 'META-INF'
+    }
+    exclude 'META-INF/MANIFEST.MF', 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
+    duplicatesStrategy = DuplicatesStrategy.FAIL
+}
+
+def relocateScala = tasks.register('relocateScala') {
+    def input = mergeScala.flatMap { it.archiveFile }
+    def rules = layout.projectDirectory.file('scala211.rules')
+    def output = layout.buildDirectory.file("libs/scala211-${version}.jar")
+    inputs.file(input)
+    inputs.file(rules)
+    outputs.file(output)
+    doLast {
+        Shader.shadeFile(
+            Shader.parseRulesFile(rules.asFile.toPath()), input.get().asFile.toPath(), output.get().asFile.toPath(),
+            false, false, true, true
+        )
+    }
+}
+
+def verifyRelocation = tasks.register('verifyRelocation') {
+    def jar = relocateScala.map { it.outputs.files.singleFile }
+    inputs.file(jar)
+    doLast {
+        def leaks = new TreeSet<String>()
+        def strings = new TreeSet<String>()
+        def remapper = new Remapper() {
+
+            @Override
+            String map(String internalName) {
+                if (internalName.startsWith('scala/')) {
+                    leaks << internalName
+                }
+                return internalName
+            }
+
+            @Override
+            Object mapValue(Object value) {
+                if (value instanceof String && value.startsWith('scala.')) {
+                    strings << value
+                }
+                return super.mapValue(value)
+            }
+
+        }
+        new ZipFile(jar.get()).withCloseable { zip ->
+            zip.entries().each { entry ->
+                if (entry.name.endsWith('.class')) {
+                    new ClassReader(zip.getInputStream(entry).bytes)
+                            .accept(new ClassRemapper(new ClassWriter(0), remapper), 0)
+                }
+            }
+        }
+        logger.lifecycle("String constants still starting with 'scala.': ${strings}")
+        if (!leaks.isEmpty()) {
+            throw new GradleException("Unrelocated types: ${leaks.take(20)}")
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn verifyRelocation
+}
+
+publishing.publications.register('maven', MavenPublication) {
+    artifactId = 'scala211'
+    artifact(relocateScala.map { it.outputs.files.singleFile }) {
+        builtBy relocateScala
+    }
+    pom {
+        description = 'Scala 2.11 runtime relocated from scala to scala211, for Cleanroom'
+        licenses {
+            license {
+                name = 'BSD-3-Clause'
+                url = 'https://opensource.org/licenses/BSD-3-Clause'
+            }
+        }
+    }
+}

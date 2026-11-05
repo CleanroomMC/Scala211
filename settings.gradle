@@ -1,0 +1,14 @@
+pluginManagement {
+    repositories {
+        maven {
+            url = 'https://maven.cleanroommc.com'
+        }
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    id 'com.cleanroommc.conventions.settings' version '1.4.5'
+}
+
+rootProject.name = 'scala211'
